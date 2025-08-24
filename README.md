@@ -1,2 +1,523 @@
 # Peer_tutor_matchmaker
-CS PROJECT
+
+
+
+from flask import Flask, request, render_template_string, redirect, session, url_for, flash
+from markupsafe import escape
+import sqlite3
+import os
+import datetime
+
+app = Flask(__name__)
+app.secret_key = os.environ.get('SECRET_KEY', 'super-secure-default')
+app.config['DATABASE'] = os.environ.get('DATABASE_URL', 'peer_tutor_final.db')
+
+# Subject normalization mapping
+SUBJECT_ALIASES = {
+    'math': 'mathematics', 'maths': 'mathematics', 'mathematics': 'mathematics',
+    'chem': 'chemistry', 'chemistry': 'chemistry',
+    'phy': 'physics', 'physics': 'physics',
+    # add more as needed
+}
+def normalize_subject(subject):
+    s = subject.strip().lower()
+    return SUBJECT_ALIASES.get(s, s)
+
+def get_db():
+    db = sqlite3.connect(app.config['DATABASE'])
+    db.row_factory = sqlite3.Row
+    return db
+
+def init_db():
+    with get_db() as db:
+        db.execute('DROP TABLE IF EXISTS messages')
+        db.execute('DROP TABLE IF EXISTS matches')
+        db.execute('DROP TABLE IF EXISTS doubts')
+        db.execute('DROP TABLE IF EXISTS users')
+        db.execute('''
+            CREATE TABLE users(
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                name TEXT UNIQUE NOT NULL,
+                grade TEXT NOT NULL,
+                role TEXT NOT NULL,
+                strong_subjects TEXT,
+                studying_subjects TEXT,
+                last_role_change TIMESTAMP,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        ''')
+        db.execute('''
+            CREATE TABLE doubts(
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                student_id INTEGER NOT NULL,
+                subject TEXT NOT NULL,
+                doubt_type TEXT NOT NULL,
+                doubt_text TEXT,
+                doubt_link TEXT,
+                status TEXT DEFAULT 'pending',
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY(student_id) REFERENCES users(id)
+            )
+        ''')
+        db.execute('''
+            CREATE TABLE matches(
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                doubt_id INTEGER NOT NULL,
+                helper_id INTEGER NOT NULL,
+                status TEXT DEFAULT 'pending',
+                matched_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY(doubt_id) REFERENCES doubts(id),
+                FOREIGN KEY(helper_id) REFERENCES users(id)
+            )
+        ''')
+        db.execute('''
+            CREATE TABLE messages(
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                match_id INTEGER NOT NULL,
+                sender_id INTEGER NOT NULL,
+                text TEXT NOT NULL,
+                sent_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY(match_id) REFERENCES matches(id),
+                FOREIGN KEY(sender_id) REFERENCES users(id)
+            )
+        ''')
+        db.commit()
+
+init_db()
+
+# ---------------- Templates -----------------
+base_template = '''
+<!DOCTYPE html>
+<html>
+<head>
+  <title>Peer Tutor Matchmaker</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <link href="https://fonts.googleapis.com/css2?family=Poppins:wght@400;600&display=swap" rel="stylesheet">
+  <style>
+  body {{ font-family: 'Poppins', sans-serif; background: #f4f8fb; text-align: center; margin: 0; padding: 2rem; }}
+  h1, h2 {{ color: #2c3e50; }}
+  a {{ color: #2c7be5; text-decoration: none; }}
+  a:hover {{ text-decoration: underline; }}
+  form {{ background: #ffffff; display: inline-block; padding: 20px; border-radius: 12px; box-shadow: 0px 4px 8px rgba(0,0,0,0.1); margin-top: 1rem; min-width: 320px; }}
+  input, select, textarea, button {{ margin: 8px 0; padding: 8px; width: 90%; border-radius: 6px; border: 1px solid #ccc; font-family: inherit; }}
+  textarea {{ min-height: 90px; }}
+  button {{ background: #3498db; color: white; border: none; cursor: pointer; font-weight: 600; }}
+  button:hover {{ background: #2980b9; }}
+  .quote {{ font-style: italic; color: #555; margin-bottom: 20px; }}
+  .disclaimer {{ background: #ffe6e6; color: #b30000; padding: 8px; border-radius: 6px; font-size: 14px; margin-bottom: 10px; display: inline-block; }}
+  .card {{ background: #fff; padding: 16px; border-radius: 12px; box-shadow: 0 2px 6px rgba(0,0,0,0.08); display: inline-block; text-align: left; margin: 8px; min-width: 340px; max-width: 720px; }}
+  .pill {{ padding: 2px 8px; border-radius: 999px; background:#eef3fb; color:#265f9a; font-size:12px; }}
+  .muted {{ color:#6b7280; font-size: 12px; }}
+  .chatbox {{ max-width: 680px; margin: 0 auto; text-align:left; }}
+  .msg {{ padding:8px 12px; border-radius:10px; margin:6px 0; display:inline-block; }}
+  .me {{ background:#e6f4ff; }}
+  .them {{ background:#f1f5f9; }}
+  .toolbar {{ margin: 12px 0; }}
+</style>
+</head>
+<body>
+{content}
+</body>
+</html>
+'''
+
+welcome_template = '''
+<h1>Peer Tutor Matchmaker</h1>
+<p class="quote">"When one teaches, two learn." – Robert Heinlein</p>
+<form method="POST" action="/start">
+  <input type="text" name="name" placeholder="Enter your name" required><br>
+  <button type="submit">Begin</button>
+</form>
+'''
+
+survey_template = '''
+<h1>Hello {name}</h1>
+<div class="disclaimer">⚠️ Once you choose Helper/Receiver, you can only switch roles after 1 hour.</div>
+<form method="POST" action="/survey">
+  Grade: <input type="text" name="grade" required><br>
+  Subjects: <input type="text" name="studying_subjects" placeholder="e.g., Physics, Chemistry"><br>
+  Role:
+  <select name="role" required>
+    <option value="helper">Help others</option>
+    <option value="receiver">Get help</option>
+  </select><br>
+  <button type="submit">Continue</button>
+</form>
+'''
+
+register_helper_template = '''
+<h1>Register as Helper</h1>
+<form method="POST" action="/register_helper">
+  Strong Subjects: <input type="text" name="strong_subjects" placeholder="e.g., Physics, Calculus" required>
+  <button type="submit">Submit</button>
+</form>
+<div class="toolbar"><a href="/">Home</a></div>
+'''
+
+submit_doubt_template = '''
+<h1>Submit Doubt</h1>
+<form method="POST" action="/submit_doubt">
+  Subject: <input type="text" name="subject" required><br>
+  Type:
+  <select name="doubt_type" required>
+    <option value="concept">Concept-based</option>
+    <option value="numerical">Numerical</option>
+    <option value="diagram">Diagram</option>
+  </select><br>
+  Description: <textarea name="doubt_text" placeholder="Describe your doubt..."></textarea><br>
+  Link (optional): <input type="text" name="doubt_link" placeholder="Drive link / image URL (optional)">
+  <button type="submit">Submit</button>
+</form>
+<div class="toolbar"><a href="/my_matches">My Matches</a> • <a href="/">Home</a></div>
+'''
+
+result_template = '''
+<h2>{title}</h2>
+<p>{message}</p>
+<a href="/">Home</a>
+'''
+
+# ---------------- Helper functions -----------------
+def get_current_user():
+    if 'name' not in session:
+        return None
+    with get_db() as db:
+        return db.execute("SELECT * FROM users WHERE name=?", (session['name'],)).fetchone()
+
+@app.route('/logout')
+def logout():
+    session.clear()
+    flash("You have been logged out.")
+    return redirect(url_for('welcome'))
+
+# ---------------- Middleware -----------------
+@app.before_request
+def guard_session():
+    open_endpoints = {'welcome', 'start', 'survey_get', 'static'}
+    if request.endpoint and request.endpoint in open_endpoints:
+        return
+    if 'name' not in session:
+        return redirect(url_for('welcome'))
+
+# ---------------- Routes -----------------
+
+@app.route('/')
+def welcome():
+    return render_template_string(base_template.format(content=welcome_template))
+
+@app.route('/start', methods=['POST'])
+def start():
+    name = request.form.get('name','').strip()
+    if not name:
+        flash('Name is required!')
+        return redirect(url_for('welcome'))
+    session['name'] = name
+    return render_template_string(base_template.format(content=survey_template.format(name=name)))
+
+@app.route('/survey', methods=['GET'])
+def survey_get():
+    if 'name' not in session:
+        return redirect(url_for('welcome'))
+    return render_template_string(base_template.format(content=survey_template.format(name=session['name'])))
+
+@app.route('/survey', methods=['POST'])
+def survey():
+    user_name = session.get('name')
+    if not user_name:
+        return redirect(url_for('welcome'))
+
+    grade = request.form['grade'].strip()
+    role = request.form['role'].strip()
+    studying_subjects = request.form.get('studying_subjects','').strip()
+
+    now = datetime.datetime.now()
+    with get_db() as db:
+        existing = db.execute('SELECT * FROM users WHERE name=?', (user_name,)).fetchone()
+        last_change_dt = now - datetime.timedelta(hours=2)
+        if existing:
+            last_change = existing['last_role_change']
+            if last_change and isinstance(last_change, str):
+                try:
+                    last_change_dt = datetime.datetime.fromisoformat(last_change)
+                except Exception:
+                    pass
+            if (now - last_change_dt).total_seconds() < 3600 and role != existing['role']:
+                return render_template_string(base_template.format(content=result_template.format(
+                    title='Role Change Blocked',
+                    message='You can only change your role once every 1 hour.'
+                )))
+            db.execute('UPDATE users SET grade=?, role=?, studying_subjects=?, last_role_change=? WHERE name=?',
+                       (grade, role, studying_subjects, now.isoformat(), user_name))
+        else:
+            db.execute('INSERT INTO users (name, grade, role, studying_subjects, last_role_change) VALUES (?,?,?,?,?)',
+                       (user_name, grade, role, studying_subjects, now.isoformat()))
+        db.commit()
+
+    if role == 'helper':
+        user = db.execute('SELECT * FROM users WHERE name=?', (user_name,)).fetchone()
+        if not user['strong_subjects']:
+            return render_template_string(base_template.format(content=register_helper_template))
+        else:
+            return redirect(url_for('helper_dashboard'))
+    return render_template_string(base_template.format(content=submit_doubt_template))
+
+@app.route('/register_helper', methods=['POST'])
+def register_helper():
+    user = get_current_user()
+    if not user:
+        return redirect(url_for('welcome'))
+    strong_subjects = request.form.get('strong_subjects','').strip()
+    subjects_list = [normalize_subject(subj) for subj in strong_subjects.split(',')]
+    normalized_subjects = ','.join(subjects_list)
+    with get_db() as db:
+        db.execute('UPDATE users SET strong_subjects=? WHERE id=?', (normalized_subjects, user['id']))
+        db.commit()
+    flash("Registered as helper.")
+    return redirect(url_for('helper_dashboard'))
+
+@app.route('/submit_doubt', methods=['POST'])
+def submit_doubt():
+    user = get_current_user()
+    if not user:
+        return redirect(url_for('welcome'))
+
+    subject = normalize_subject(request.form['subject'].strip())
+    dtype = request.form['doubt_type'].strip()
+    dtext = request.form.get('doubt_text','').strip()
+    dlink = request.form.get('doubt_link','').strip()
+
+    with get_db() as db:
+        db.execute('INSERT INTO doubts (student_id, subject, doubt_type, doubt_text, doubt_link) VALUES (?,?,?,?,?)',
+                   (user['id'], subject, dtype, dtext, dlink))
+        doubt_id = db.execute('SELECT last_insert_rowid() AS id').fetchone()['id']
+
+        # Match helpers by normalized subjects
+        helpers = db.execute("""
+            SELECT id, name, strong_subjects FROM users
+            WHERE role='helper' AND strong_subjects IS NOT NULL
+        """).fetchall()
+        suggested_helper = None
+        for helper in helpers:
+            helper_subjects = [normalize_subject(x) for x in helper['strong_subjects'].split(',')]
+            if subject in helper_subjects:
+                suggested_helper = helper
+                break
+
+        if suggested_helper:
+            db.execute('INSERT INTO matches (doubt_id, helper_id, status) VALUES (?,?,\'pending\')', (doubt_id, suggested_helper['id']))
+        db.commit()
+
+    msg = "Doubt submitted! Helpers can now claim it from the dashboard. <br><a href='/my_matches'>My Matches</a>"
+    if suggested_helper:
+        msg = f"Doubt submitted! Suggested helper: {suggested_helper['name']} (pending). <br><a href='/my_matches'>My Matches</a>"
+    return render_template_string(base_template.format(content=result_template.format(title='Submitted', message=msg)))
+
+# ---------------- Helper Dashboard -----------------
+
+@app.route('/helper_dashboard')
+def helper_dashboard():
+    user = get_current_user()
+    if not user or user['role'] != 'helper':
+        return redirect(url_for('welcome'))
+    if not user['strong_subjects']:
+        return render_template_string(base_template.format(content=register_helper_template))
+    with get_db() as db:
+        doubts = db.execute('''
+            SELECT d.id AS doubt_id, u.name AS receiver_name, d.subject, d.doubt_type, d.doubt_text, d.created_at
+            FROM doubts d
+            JOIN users u ON d.student_id = u.id
+            WHERE d.status='pending' AND u.id != ?
+            ORDER BY d.created_at ASC
+        ''', (user['id'],)).fetchall()
+    items = ["<h1>Pending Doubts</h1><div class='muted'>These are doubts not yet claimed by any helper. Once you claim, they move to your Matches.</div>"]
+    for d in doubts:
+        items.append(f"""
+        <div class='card'>
+            <div><strong>Receiver:</strong> {d['receiver_name']}</div>
+            <div><strong>Subject:</strong> {d['subject']} &nbsp; <strong>Type:</strong> {d['doubt_type']}</div>
+            <div style='margin:6px 0'><em>{escape(d['doubt_text'] or '')}</em></div>
+            <div class='toolbar'>
+                <a href='{url_for('claim_doubt_confirm', doubt_id=d['doubt_id'])}'>Help This Student</a>
+            </div>
+        </div>
+        """)
+    items.append("<div class='toolbar'><a href='/my_matches'>My Matches</a> • <a href='/'>Home</a></div>")
+    return render_template_string(base_template.format(content="\n".join(items)))
+
+# --- Claim flow with confirmation (marks in_progress on confirm) ---
+
+@app.route('/claim_doubt/<int:doubt_id>')
+def claim_doubt_confirm(doubt_id):
+    user = get_current_user()
+    if not user or user['role'] != 'helper':
+        return redirect(url_for('welcome'))
+
+    with get_db() as db:
+        d = db.execute('''
+            SELECT d.*, u.name AS receiver_name
+            FROM doubts d JOIN users u ON d.student_id=u.id
+            WHERE d.id=?
+        ''', (doubt_id,)).fetchone()
+    if not d or d['status'] != 'pending':
+        return render_template_string(base_template.format(content=result_template.format(
+            title='Cannot Claim', message='This doubt is no longer available.'
+        )))
+
+    content = f"""
+    <h1>Confirm Claim</h1>
+    <div class='card'>
+      <div><strong>Receiver:</strong> {d['receiver_name']}</div>
+      <div><strong>Subject:</strong> {d['subject']} &nbsp; <strong>Type:</strong> {d['doubt_type']}</div>
+      <div style='margin:6px 0'><em>{escape(d['doubt_text'] or '')}</em></div>
+      <form method='POST' action='{url_for('claim_doubt_apply', doubt_id=doubt_id)}'>
+        <button type='submit'>Yes, I will help</button>
+        <a href='/helper_dashboard'><button type='button'>No, Cancel</button></a>
+      </form>
+      <div class='toolbar'><a href='/helper_dashboard'>Cancel</a></div>
+    </div>
+    """
+    return render_template_string(base_template.format(content=content))
+
+@app.route('/claim_doubt/<int:doubt_id>/apply', methods=['POST'])
+def claim_doubt_apply(doubt_id):
+    user = get_current_user()
+    if not user or user['role'] != 'helper':
+        return redirect(url_for('welcome'))
+
+    with get_db() as db:
+        d = db.execute('SELECT * FROM doubts WHERE id=?', (doubt_id,)).fetchone()
+        if not d or d['status'] != 'pending':
+            return render_template_string(base_template.format(content=result_template.format(
+                title='Cannot Claim', message='This doubt is no longer available.'
+            )))
+        # Set doubt and match status to in_progress, create match if needed
+        db.execute("UPDATE doubts SET status='in_progress' WHERE id=?", (doubt_id,))
+        m = db.execute('SELECT * FROM matches WHERE doubt_id=? ORDER BY matched_at DESC LIMIT 1', (doubt_id,)).fetchone()
+        if m:
+            db.execute("UPDATE matches SET helper_id=?, status='in_progress' WHERE id=?", (user['id'], m['id']))
+            match_id = m['id']
+        else:
+            db.execute("INSERT INTO matches (doubt_id, helper_id, status) VALUES (?, ?, 'in_progress')", (doubt_id, user['id']))
+            match_id = db.execute('SELECT last_insert_rowid() AS id').fetchone()['id']
+        db.commit()
+    return redirect(url_for('chat', match_id=match_id))
+
+# ---------------- Matches & Chat -----------------
+
+@app.route('/my_matches')
+def my_matches():
+    user = get_current_user()
+    if not user:
+        return redirect(url_for('welcome'))
+
+    with get_db() as db:
+        if user['role'] == 'receiver':
+            rows = db.execute('''
+                SELECT m.id as match_id, m.status as match_status, d.subject, d.doubt_type, d.doubt_text, d.status as doubt_status,
+                       u.name as helper
+                FROM matches m
+                JOIN doubts d ON m.doubt_id = d.id
+                JOIN users u ON m.helper_id = u.id
+                WHERE d.student_id = ?
+                ORDER BY m.matched_at DESC
+            ''', (user['id'],)).fetchall()
+        else:
+            rows = db.execute('''
+                SELECT m.id as match_id, m.status as match_status, d.subject, d.doubt_type, d.doubt_text, d.status as doubt_status,
+                       u.name as receiver
+                FROM matches m
+                JOIN doubts d ON m.doubt_id = d.id
+                JOIN users u ON d.student_id = u.id
+                WHERE m.helper_id = ?
+                ORDER BY m.matched_at DESC
+            ''', (user['id'],)).fetchall()
+
+    items = ["<h1>My Matches</h1><div class='muted'>These are doubts that you have claimed or been matched to.</div>"]
+    for r in rows:
+        people = (f"Helper: {r['helper']}" if user['role']=='receiver' else f"Receiver: {r['receiver']}")
+        items.append(f"""
+        <div class='card'>
+          <div><span class='pill'>{r['match_status']}</span> <span class='muted'>• Doubt: {r['doubt_status']}</span></div>
+          <div><strong>Subject:</strong> {r['subject']} &nbsp; <strong>Type:</strong> {r['doubt_type']}</div>
+          <div style='margin:6px 0'><em>{escape(r['doubt_text'] or '')}</em></div>
+          <div>{people}</div>
+          <div class='toolbar'>
+            <a href='{url_for('chat', match_id=r['match_id'])}'>Open Chat</a>
+            {' • <a href="' + url_for('resolve_match', match_id=r['match_id']) + '">Mark Resolved</a>' if r['match_status']!='resolved' else ''}
+          </div>
+        </div>
+        """)
+    items.append("<div class='toolbar'><a href='/'>Home</a> • <a href='/logout'>Logout</a></div>")
+    return render_template_string(base_template.format(content=" ".join(items)))
+
+@app.route('/match/<int:match_id>/resolve')
+def resolve_match(match_id):
+    user = get_current_user()
+    if not user:
+        return redirect(url_for('welcome'))
+    with get_db() as db:
+        m = db.execute('SELECT m.*, d.id as doubt_id, d.student_id FROM matches m JOIN doubts d ON m.doubt_id=d.id WHERE m.id=?', (match_id,)).fetchone()
+        if not m or (user['id'] not in (m['helper_id'], m['student_id'])):
+            return render_template_string(base_template.format(content=result_template.format(title='Not allowed', message='You are not in this match.')))
+        db.execute("UPDATE matches SET status='resolved' WHERE id=?", (match_id,))
+        db.execute("UPDATE doubts SET status='resolved' WHERE id=?", (m['doubt_id'],))
+        db.commit()
+    return redirect(url_for('my_matches'))
+
+@app.route('/chat/<int:match_id>')
+def chat(match_id):
+    user = get_current_user()
+    if not user:
+        return redirect(url_for('welcome'))
+    with get_db() as db:
+        info = db.execute('''
+            SELECT m.*, d.student_id, u1.name as helper_name, u2.name as receiver_name
+            FROM matches m
+            JOIN doubts d ON m.doubt_id = d.id
+            JOIN users u1 ON m.helper_id = u1.id
+            JOIN users u2 ON d.student_id = u2.id
+            WHERE m.id=?
+        ''', (match_id,)).fetchone()
+        if not info or user['id'] not in (info['helper_id'], info['student_id']):
+            return render_template_string(base_template.format(content=result_template.format(title='Not allowed', message='You are not in this match.')))
+        msgs = db.execute('SELECT * FROM messages WHERE match_id=? ORDER BY sent_at ASC, id ASC', (match_id,)).fetchall()
+
+    lines = [f"<h1>Chat</h1>",
+             f"<div class='muted'>Helper: {info['helper_name']} • Receiver: {info['receiver_name']} • Status: <span class='pill'>{info['status']}</span></div>",
+             "<div class='chatbox'>"]
+    for m in msgs:
+        sender_class = 'me' if m['sender_id'] == user['id'] else 'them'
+        lines.append(f"<div class='msg {sender_class}'>{escape(m['text'])}</div>")
+    lines.append("</div>")
+
+    if info['status'] != 'resolved':
+        lines.append(f"""
+        <form method='POST' action='{url_for('send_message', match_id=match_id)}'>
+            <input type='text' name='text' placeholder='Type your message...' required>
+            <button type='submit'>Send</button>
+        </form>
+        """)
+    lines.append(f"<div class='toolbar'><a href='/chat/{match_id}'>Refresh Chat</a> • <a href='/my_matches'>Back to Matches</a> • <a href='/'>Home</a></div>")
+    return render_template_string(base_template.format(content="\n".join(lines)))
+
+@app.route('/chat/<int:match_id>/send', methods=['POST'])
+def send_message(match_id):
+    user = get_current_user()
+    if not user:
+        return redirect(url_for('welcome'))
+    text = request.form.get('text','').strip()
+    if not text:
+        return redirect(url_for('chat', match_id=match_id))
+    with get_db() as db:
+        match = db.execute('SELECT * FROM matches WHERE id=?', (match_id,)).fetchone()
+        if not match:
+            return render_template_string(base_template.format(content=result_template.format(title='Not found', message='Match missing.')))
+        student_id = db.execute('SELECT student_id FROM doubts WHERE id=?', (match['doubt_id'],)).fetchone()['student_id']
+        if user['id'] not in (match['helper_id'], student_id):
+            return render_template_string(base_template.format(content=result_template.format(title='Not allowed', message='You are not in this match.')))
+        db.execute('INSERT INTO messages (match_id, sender_id, text) VALUES (?,?,?)', (match_id, user['id'], text))
+        db.commit()
+    return redirect(url_for('chat', match_id=match_id))
+
+if __name__ == '__main__':
+    app.run(debug=True, port=int(os.environ.get('PORT', '5006')))
